@@ -1,0 +1,7 @@
+/venv
+.env
+todos
+credentials.json
+token.json
+token_calendar.json
+/__pycache__
