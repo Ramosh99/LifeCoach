@@ -1,36 +1,30 @@
 """
 streamlit_app.py
-A pure, conversational AI LifeCoach chat bot. 
-No external tools or APIs.
+A thin UI client connecting to the LangGraph orchestrator in graph.py.
 """
-
 import streamlit as st
-from openai import OpenAI
-from settings import settings
+import pandas as pd
+import json
+import uuid
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
-# Initialize OpenRouter / OpenAI client
-_client = OpenAI(
-    api_key=settings.openrouter_api_key,
-    base_url=settings.openrouter_base_url,
-    default_headers={
-        "HTTP-Referer": settings.openrouter_app_url,
-        "X-Title": settings.openrouter_app_name,
-    },
-)
+from settings import settings
+from graph import agent_graph
 
 def _is_set(v: str) -> bool:
     return bool((v or "").strip())
 
 def _mask(v: str) -> str:
     if not v: return "Not set"
-    if len(v) <= 8: return "*" * len(v)
     return f"{v[:4]}...{v[-4:]}"
 
-# --- Page Config ---
 st.set_page_config(page_title="LifeCoach AI", page_icon="🧭", layout="wide")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Persistent thread ID for LangGraph memory
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
 # --- Sidebar ---
 with st.sidebar:
@@ -39,59 +33,80 @@ with st.sidebar:
     with st.expander("Debug"):
         st.write(f"Model: {settings.model}")
         st.write(f"Key: {_mask(settings.openrouter_api_key)}")
+        st.write(f"Thread: {st.session_state.thread_id[:8]}")
     st.divider()
     if st.button("🔄 Start Over", width="stretch"):
-        st.session_state.messages = []
+        st.session_state.thread_id = str(uuid.uuid4())
         st.rerun()
 
-# --- Title ---
 st.title("🧭 LifeCoach AI")
-st.caption("Your personal AI life and learning coach. Let's chat!")
+st.caption("Your personal AI life and learning coach powered by LangGraph.")
 st.divider()
 
-# --- Initial Greeting ---
-if not st.session_state.messages:
+# Get current state from LangGraph
+try:
+    state = agent_graph.get_state(config)
+    messages = state.values.get("messages", [])
+except Exception:
+    messages = []
+
+# If no messages exist yet, have the bot send a greeting
+if not messages:
     greeting = "👋 Hi! I'm your AI LifeCoach. I can help you set goals, build study routines, or discuss career plans. What's on your mind today?"
-    st.session_state.messages.append({"role": "assistant", "content": greeting})
+    # We push an initial AIMessage to the graph to anchor the conversation
+    agent_graph.update_state(config, {"messages": [AIMessage(content=greeting)]})
+    state = agent_graph.get_state(config)
+    messages = state.values.get("messages", [])
 
-# --- Display History ---
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+def _render_timetable(json_str: str):
+    try:
+        data = json.loads(json_str)
+        if isinstance(data, list) and len(data) > 0:
+            st.markdown("🗓️ **Your Personalized Study Timetable:**")
+            df = pd.DataFrame([{
+                "Week": f"Week {r.get('week', '')}",
+                "Dates": f"{r.get('start_date', '')} → {r.get('end_date', '')}",
+                "Topic": r.get("skill", ""),
+                "Duration": r.get("duration", ""),
+                "Notes": r.get("daily_hours", "")
+            } for r in data])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"Failed to render timetable natively. Raw output:\n{json_str}")
 
-# --- Chat Input ---
+# Render history
+for msg in messages:
+    if isinstance(msg, AIMessage):
+        # Only render AI content if it exists
+        if msg.content:
+            with st.chat_message("assistant"):
+                st.markdown(msg.content)
+    elif isinstance(msg, HumanMessage):
+        with st.chat_message("user"):
+            st.markdown(msg.content)
+    elif isinstance(msg, ToolMessage):
+        if msg.name == "build_personalized_timetable":
+            # The tool returned the raw JSON timetable, render it nicely
+            with st.chat_message("assistant"):
+                _render_timetable(msg.content)
+
+# Input
 if prompt := st.chat_input("Type your message..."):
-    # Add user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # Immediately render the user's box
     with st.chat_message("user"):
         st.markdown(prompt)
-
-    # Add AI response
+    
+    # Process
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                system_prompt = (
-                    "You are LifeCoach AI, a friendly, encouraging, and insightful personal life and learning coach. "
-                    "Your goal is to help the user identify their goals, break them down into actionable steps, "
-                    "and provide ongoing motivation and context-aware advice. "
-                    "Keep your responses conversational, engaging, and highly focused on the user's personal growth."
+                # Invoke Graph
+                agent_graph.invoke(
+                    {"messages": [HumanMessage(content=prompt)]}, 
+                    config=config
                 )
                 
-                # Build message payload for the LLM
-                api_messages = [{"role": "system", "content": system_prompt}]
-                for m in st.session_state.messages:
-                    api_messages.append({"role": m["role"], "content": m["content"]})
-
-                # Stream response (or wait for full completion)
-                response = _client.chat.completions.create(
-                    model=settings.model,
-                    max_tokens=1500,
-                    messages=api_messages,
-                )
-                
-                reply = response.choices[0].message.content
-                st.markdown(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
-                
+                # Rerun to cleanly re-draw all messages including tool outputs
+                st.rerun()
             except Exception as e:
                 st.error(f"Error communicating with the AI: {e}")
