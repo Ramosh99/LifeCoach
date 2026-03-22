@@ -5,6 +5,10 @@ langsmith>=0.1.0
 openai>=1.30.0
 streamlit>=1.36.0
 
+# MCP
+mcp>=1.0.0
+langchain-mcp-adapters>=0.1.0
+
 # Google APIs
 google-api-python-client>=2.100.0
 google-auth-oauthlib>=1.1.0
